@@ -25,8 +25,9 @@ class JoinFilter:
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+        result = message_protocol.internal.deserialize(message)
+        client_id, fruit_top = result
+        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
         ack()
 
     def start(self):

@@ -32,6 +32,38 @@ services:
     volumes:
     - ./datasets:/datasets
     - ./output:/output
+  client_1:
+    build:
+      context: ./src/
+      dockerfile: client/Dockerfile
+    container_name: client_1
+    depends_on:
+    - sum_0
+    environment:
+    - INPUT_FILE=/datasets/input_1.csv
+    - OUTPUT_FILE=/output/output_1.csv
+    - PYTHONUNBUFFERED=1
+    - SERVER_HOST=gateway
+    - SERVER_PORT=5678
+    volumes:
+    - ./datasets:/datasets
+    - ./output:/output
+  client_2:
+    build:
+      context: ./src/
+      dockerfile: client/Dockerfile
+    container_name: client_2
+    depends_on:
+    - sum_0
+    environment:
+    - INPUT_FILE=/datasets/input_2.csv
+    - OUTPUT_FILE=/output/output_2.csv
+    - PYTHONUNBUFFERED=1
+    - SERVER_HOST=gateway
+    - SERVER_PORT=5678
+    volumes:
+    - ./datasets:/datasets
+    - ./output:/output
   gateway:
     build:
       context: ./src/

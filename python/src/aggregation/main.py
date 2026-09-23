@@ -23,21 +23,26 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.fruit_top_for_client = {}
 
-    def _process_data(self, fruit, amount):
+    def _process_data(self, client_id, fruit, amount):
         logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
+        self.fruit_top_for_client.setdefault(client_id, [])
+        fruit_top = self.fruit_top_for_client[client_id]
+        for i in range(len(fruit_top)):
+            if fruit_top[i].fruit == fruit:
+                fruit_top[i] = fruit_top[i] + fruit_item.FruitItem(
                     fruit, amount
                 )
                 return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        bisect.insort(self.fruit_top_for_client[client_id], fruit_item.FruitItem(fruit, amount))
 
-    def _process_eof(self):
+    def _process_eof(self, client_id):
         logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
+
+        fruit_top_list = self.fruit_top_for_client.pop(client_id, [])
+        
+        fruit_chunk = list(fruit_top_list[-TOP_SIZE:])
         fruit_chunk.reverse()
         fruit_top = list(
             map(
@@ -45,16 +50,16 @@ class AggregationFilter:
                 fruit_chunk,
             )
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
+        self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
+
 
     def process_messsage(self, message, ack, nack):
         logging.info("Process message")
         fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
+        if len(fields) == 3:
             self._process_data(*fields)
         else:
-            self._process_eof()
+            self._process_eof(fields[0])
         ack()
 
     def start(self):
