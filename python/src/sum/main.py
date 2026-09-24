@@ -25,19 +25,38 @@ class SumFilter:
             )
             self.data_output_exchanges.append(data_output_exchange)
         self.amount_by_fruit_and_client = {}
+        self.processed_eof_clients = set()
+        self.lock = threading.RLock()
+
+        self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+        )
+        self.control_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+        )
+
+        threading.Thread(
+            target=self.control_consumer.start_consuming,
+            args=(self._process_control_message,),
+            daemon=True,
+        ).start()
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
-        self.amount_by_fruit_and_client.setdefault(client_id, {})
-        self.amount_by_fruit_and_client[client_id][fruit] = self.amount_by_fruit_and_client[client_id].get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+        with self.lock:
+            self.amount_by_fruit_and_client.setdefault(client_id, {})
+            self.amount_by_fruit_and_client[client_id][fruit] = self.amount_by_fruit_and_client[client_id].get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
 
     def _process_eof(self, client_id):
-        logging.info(f"Broadcasting data messages for client {client_id}")
+        with self.lock:
+            if client_id in self.processed_eof_clients:
+                return
+            self.processed_eof_clients.add(client_id)
+            client_data = self.amount_by_fruit_and_client.pop(client_id, {})
 
-        client_data = self.amount_by_fruit_and_client.pop(client_id, {})
-        
+        logging.info(f"Broadcasting data messages for client {client_id}")
         for final_fruit_item in client_data.values():
             for data_output_exchange in self.data_output_exchanges:
                 data_output_exchange.send(
@@ -50,13 +69,21 @@ class SumFilter:
         for data_output_exchange in self.data_output_exchanges:
             data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
+    def _process_control_message(self, message, ack, nack):
+        fields = message_protocol.internal.deserialize(message)
+        client_id = fields[0]
+        with self.lock:
+            self._process_eof(client_id)
+        ack()
 
     def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 3:
-            self._process_data(*fields)
-        else:
-            self._process_eof(fields[0])
+        with self.lock:
+            fields = message_protocol.internal.deserialize(message)
+            if len(fields) == 3:
+                self._process_data(*fields)
+            else:
+                self._process_eof(fields[0])
+                self.control_exchange.send(message_protocol.internal.serialize([fields[0]])) ## le paso a los otros sum que el cliente termino
         ack()
 
     def start(self):

@@ -29,6 +29,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
                 nack = lambda: ch.basic_nack(delivery_tag=method.delivery_tag)
                 on_message_callback(body, ack, nack)
 
+            self.channel.basic_qos(prefetch_count=1)
             self.channel.basic_consume(queue=self.queue_name, on_message_callback=callback)
             self.channel.start_consuming()
 
