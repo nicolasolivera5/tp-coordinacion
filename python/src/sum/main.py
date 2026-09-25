@@ -2,6 +2,8 @@ import os
 import logging
 import threading
 import hashlib
+import signal
+import sys
 
 from common import middleware, message_protocol, fruit_item
 
@@ -41,6 +43,44 @@ class SumFilter:
             args=(self._process_control_message,),
             daemon=True,
         ).start()
+
+        self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
+
+    def handle_sigterm(self, signum, frame):
+        logging.info("Received SIGTERM signal")
+        self.stop()
+        if self._prev_sigterm_handler:
+            self._prev_sigterm_handler(signum, frame)
+
+    def stop(self):
+        try:
+            self.input_queue.stop_consuming()
+        except Exception:
+            pass
+        try:
+            self.control_consumer.stop_consuming()
+        except Exception:
+            pass
+        self.close()
+
+    def close(self):
+        try:
+            self.input_queue.close()
+        except Exception:
+            pass
+        try:
+            self.control_consumer.close()
+        except Exception:
+            pass
+        try:
+            self.control_exchange.close()
+        except Exception:
+            pass
+        for exchange in self.data_output_exchanges:
+            try:
+                exchange.close()
+            except Exception:
+                pass
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data")
@@ -89,12 +129,18 @@ class SumFilter:
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self._process_data_messsage)
+        try:
+            self.input_queue.start_consuming(self._process_data_messsage)
+        finally:
+            self.close()
 
 def main():
     logging.basicConfig(level=logging.INFO)
     sum_filter = SumFilter()
-    sum_filter.start()
+    try:
+        sum_filter.start()
+    except SystemExit:
+        pass
     return 0
 
 
