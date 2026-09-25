@@ -34,13 +34,12 @@ class AggregationFilter:
         self.stop()
         if self._prev_sigterm_handler:
             self._prev_sigterm_handler(signum, frame)
-
+    
     def stop(self):
         try:
             self.input_exchange.stop_consuming()
         except Exception:
             pass
-        self.close()
 
     def close(self):
         try:

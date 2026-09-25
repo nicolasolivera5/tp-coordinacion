@@ -39,7 +39,6 @@ class JoinFilter:
             self.input_queue.stop_consuming()
         except Exception:
             pass
-        self.close()
 
     def close(self):
         try:

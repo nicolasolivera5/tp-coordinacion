@@ -39,12 +39,20 @@ class SumFilter:
         )
 
         threading.Thread(
-            target=self.control_consumer.start_consuming,
-            args=(self._process_control_message,),
+            target=self._start_control_consumer,
             daemon=True,
         ).start()
 
         self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
+
+    def _start_control_consumer(self):
+        try:
+            self.control_consumer.start_consuming(self._process_control_message)
+        finally:
+            try:
+                self.control_consumer.close()
+            except Exception:
+                pass
 
     def handle_sigterm(self, signum, frame):
         logging.info("Received SIGTERM signal")
@@ -58,18 +66,15 @@ class SumFilter:
         except Exception:
             pass
         try:
-            self.control_consumer.stop_consuming()
+            self.control_consumer.connection.add_callback_threadsafe(
+                self.control_consumer.stop_consuming
+            )
         except Exception:
             pass
-        self.close()
 
     def close(self):
         try:
             self.input_queue.close()
-        except Exception:
-            pass
-        try:
-            self.control_consumer.close()
         except Exception:
             pass
         try:
