@@ -24,5 +24,22 @@ En la etapa de `Sum` todas las instancias compiten como consumidores de la misma
 
 ### 2.2 Resolución de Condiciones de Carrera:
 - **Prefetch Unitario (`prefetch_count=1`)**: Por defecto, RabbitMQ entrega mensajes en ráfagas al buffer TCP del cliente. Sin límite de prefetch, un `Sum` podía tener datos en su memoria local aún no procesados cuando le llegaba el aviso de control, provocando pérdidas de datos. Con `basic_qos(prefetch_count=1)`, RabbitMQ entrega estrictamente un mensaje a la vez por consumidor, garantizando que no existan mensajes ocultos en buffers locales.
-- **Exclusión Mutua (`threading.RLock`)**: Se sincronizó el procesamiento del mensaje en el hilo principal (`process_data_message`) con el callback del hilo de control (`_process_control_message`). Si un `Sum` se encuentra computando una fruta cuando llega el aviso de control, el hilo de control espera a que finalice la suma antes de vaciar el acumulador y emitir el `EOF`.
+- **Exclusión Mutua (`threading.RLock`)**: Se sincronizó el procesamiento del mensaje en el hilo principal (`_process_data_messsage`) con el callback del hilo de control (`_process_control_message`). Si un `Sum` se encuentra computando una fruta cuando llega el aviso de control, el hilo de control espera a que finalice la suma antes de vaciar el acumulador y emitir el `EOF`.
+
+---
+
+## 3. Coordinación entre `Sum` y `Aggregation`
+Una vez completado el procesamiento en `Sum`, se debe distribuir la información hacia las réplicas de `Aggregation`:
+- **Particionamiento por Hash (Routing Key)**: Para evitar que todas las réplicas de `Aggregation` procesen las mismas frutas de forma redundante, `Sum` aplica una función de hash (`sha256(fruit) % AGGREGATION_AMOUNT`) determinando una routing key unívoca para cada fruta. Esto garantiza que todos los registros de una fruta específica siempre converjan en la misma réplica de `Aggregation`.
+- **Broadcast de Fin de Datos (`EOF`)**: Dado que cada instancia de `Aggregation` desconoce de antemano qué frutas recibirá de cada `Sum`, toda réplica de `Sum` emite un mensaje `EOF` a cada una de las réplicas de `Aggregation`.
+- **Barrera de Sincronización en `Aggregation`**: Cada réplica de `Aggregation` mantiene un contador `eof_client_count[client_id]`. Solo cuando alcanza `SUM_AMOUNT` (es decir, cuando todas las réplicas de `Sum` terminaron de emitir sus datos para ese cliente), procede a ordenar su subconjunto de frutas y enviar su top parcial hacia `join_queue`.
+
+---
+
+## 4. Coordinación y Consolidación en `Join`
+La etapa de `Join` unifica los resultados parciales calculados por las réplicas de `Aggregation`:
+- **Recepción de Tops Parciales**: Cada réplica de `Aggregation` emite hacia `join_queue` únicamente sus `TOP_SIZE` frutas más frecuentes correspondientes a su partición.
+- **Acumulación y Recorte Final**: `JoinFilter` recibe estos tops parciales y los consolida en una estructura en memoria por cliente (`fruit_top_by_client[client_id]`). Contabiliza las recepciones mediante `eof_client_count[client_id]`.
+- **Emisión al Gateway**: Al alcanzar `AGGREGATION_AMOUNT`, se garantiza que todos los candidatos parciales fueron recibidos. Se ordenan los elementos consolidados por cantidad de mayor a menor, se recortan a las primeras `TOP_SIZE` posiciones y se envían a `results_queue` para que el `Gateway` devuelva la respuesta al cliente.
+
 

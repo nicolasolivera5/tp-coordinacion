@@ -7,9 +7,43 @@ services:
     depends_on:
     - join
     environment:
-    - AGGREGATION_AMOUNT=1
+    - AGGREGATION_AMOUNT=3
     - AGGREGATION_PREFIX=aggregation
     - ID=0
+    - MOM_HOST=rabbitmq
+    - OUTPUT_QUEUE=join_queue
+    - PYTHONUNBUFFERED=1
+    - SUM_AMOUNT=3
+    - SUM_PREFIX=sum
+    - TOP_SIZE=3
+  aggregation_1:
+    build:
+      context: ./src/
+      dockerfile: aggregation/Dockerfile
+    container_name: aggregation_1
+    depends_on:
+    - join
+    environment:
+    - AGGREGATION_AMOUNT=3
+    - AGGREGATION_PREFIX=aggregation
+    - ID=1
+    - MOM_HOST=rabbitmq
+    - OUTPUT_QUEUE=join_queue
+    - PYTHONUNBUFFERED=1
+    - SUM_AMOUNT=3
+    - SUM_PREFIX=sum
+    - TOP_SIZE=3
+  aggregation_2:
+    build:
+      context: ./src/
+      dockerfile: aggregation/Dockerfile
+    container_name: aggregation_2
+    depends_on:
+    - join
+    environment:
+    - AGGREGATION_AMOUNT=3
+    - AGGREGATION_PREFIX=aggregation
+    - ID=2
     - MOM_HOST=rabbitmq
     - OUTPUT_QUEUE=join_queue
     - PYTHONUNBUFFERED=1
@@ -93,7 +127,7 @@ services:
     depends_on:
     - gateway
     environment:
-    - AGGREGATION_AMOUNT=1
+    - AGGREGATION_AMOUNT=3
     - AGGREGATION_PREFIX=aggregation
     - INPUT_QUEUE=join_queue
     - MOM_HOST=rabbitmq
@@ -125,8 +159,10 @@ services:
     container_name: sum_0
     depends_on:
     - aggregation_0
+    - aggregation_1
+    - aggregation_2
     environment:
-    - AGGREGATION_AMOUNT=1
+    - AGGREGATION_AMOUNT=3
     - AGGREGATION_PREFIX=aggregation
     - ID=0
     - INPUT_QUEUE=input_queue
@@ -141,8 +177,10 @@ services:
     container_name: sum_1
     depends_on:
     - aggregation_0
+    - aggregation_1
+    - aggregation_2
     environment:
-    - AGGREGATION_AMOUNT=1
+    - AGGREGATION_AMOUNT=3
     - AGGREGATION_PREFIX=aggregation
     - ID=1
     - INPUT_QUEUE=input_queue
@@ -157,8 +195,10 @@ services:
     container_name: sum_2
     depends_on:
     - aggregation_0
+    - aggregation_1
+    - aggregation_2
     environment:
-    - AGGREGATION_AMOUNT=1
+    - AGGREGATION_AMOUNT=3
     - AGGREGATION_PREFIX=aggregation
     - ID=2
     - INPUT_QUEUE=input_queue

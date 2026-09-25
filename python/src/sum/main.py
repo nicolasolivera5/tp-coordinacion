@@ -1,6 +1,7 @@
 import os
 import logging
 import threading
+import hashlib
 
 from common import middleware, message_protocol, fruit_item
 
@@ -58,12 +59,9 @@ class SumFilter:
 
         logging.info(f"Broadcasting data messages for client {client_id}")
         for final_fruit_item in client_data.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
+            self.data_output_exchanges[self._get_agregation_key(final_fruit_item.fruit)].send(message_protocol.internal.serialize(
+                [client_id, final_fruit_item.fruit, final_fruit_item.amount]
+            ))
 
         logging.info(f"Broadcasting EOF message")
         for data_output_exchange in self.data_output_exchanges:
@@ -76,7 +74,11 @@ class SumFilter:
             self._process_eof(client_id)
         ack()
 
-    def process_data_messsage(self, message, ack, nack):
+    def _get_agregation_key(self, fruit):
+        hex_to_int = int(hashlib.sha256(fruit.encode()).hexdigest(), 16)
+        return hex_to_int % AGGREGATION_AMOUNT
+
+    def _process_data_messsage(self, message, ack, nack):
         with self.lock:
             fields = message_protocol.internal.deserialize(message)
             if len(fields) == 3:
@@ -87,7 +89,7 @@ class SumFilter:
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
+        self.input_queue.start_consuming(self._process_data_messsage)
 
 def main():
     logging.basicConfig(level=logging.INFO)
