@@ -93,6 +93,10 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
             for routing_key in self.routing_keys:
                 self.channel.basic_publish(exchange=self.exchange_name, routing_key=routing_key, body=message)
 
+    def send_to(self, message, routing_key):
+        with error_handler(error_msg="Error sending message"):
+            self.channel.basic_publish(exchange=self.exchange_name, routing_key=routing_key, body=message)
+
     def close(self):
         try:
             if self.channel is not None and self.channel.is_open:

@@ -39,15 +39,9 @@ class SumFilter:
         self.lock = threading.RLock()
 
         # canales de envio de control
-        self.broadcast_sender = middleware.MessageMiddlewareExchangeRabbitMQ(
+        self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
         )
-        # emisores punto a punto para enviar READY al coordinador específico
-        self.ready_senders = {}
-        for i in range(SUM_AMOUNT):
-            self.ready_senders[i] = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, SUM_CONTROL_EXCHANGE, [f"READY_{i}"]
-            )
 
         # consumidor de control (hilo secundario)
         # escucha el exchange de control con dos routing keys:
@@ -97,14 +91,9 @@ class SumFilter:
         except Exception:
             pass
         try:
-            self.broadcast_sender.close()
+            self.control_exchange.close()
         except Exception:
             pass
-        for sender in self.ready_senders.values():
-            try:
-                sender.close()
-            except Exception:
-                pass
         for exchange in self.data_output_exchanges:
             try:
                 exchange.close()
@@ -126,10 +115,10 @@ class SumFilter:
         if client_id in self.coordinators:
             coordinator_id = self.coordinators[client_id]
             count = self.msg_count_by_client[client_id]
-            if coordinator_id in self.ready_senders:
-                self.ready_senders[coordinator_id].send(
-                    message_protocol.internal.serialize(["READY", client_id, ID, count])
-                )
+            self.control_exchange.send_to(
+                message_protocol.internal.serialize(["READY", client_id, ID, count]),
+                f"READY_{coordinator_id}"
+            )
 
     def _process_eof(self, client_id):
         with self.lock:
@@ -165,7 +154,7 @@ class SumFilter:
             self._commit_coordination(client_id)
         else:
             # envia un mensaje a todas las replicas de sum para pedirles su conteo
-            self.broadcast_sender.send(
+            self.control_exchange.send(
                 message_protocol.internal.serialize(["PREPARE", client_id, ID])
             )
 
@@ -173,7 +162,7 @@ class SumFilter:
     def _commit_coordination(self, client_id):
         self.active_coordinations.pop(client_id, None)
         commit_msg = message_protocol.internal.serialize(["COMMIT", client_id])
-        self.broadcast_sender.send(commit_msg)
+        self.control_exchange.send(commit_msg)
         self._process_eof(client_id)
 
     # procesa los mensajes de control
@@ -196,10 +185,10 @@ class SumFilter:
                 count = self.msg_count_by_client.get(client_id, 0)
 
                 # respondo READY con el conteo unicamente al coordinador
-                if coordinator_id in self.ready_senders:
-                    self.ready_senders[coordinator_id].send(
-                        message_protocol.internal.serialize(["READY", client_id, ID, count])
-                    )
+                self.control_exchange.send_to(
+                    message_protocol.internal.serialize(["READY", client_id, ID, count]),
+                    f"READY_{coordinator_id}"
+                )
 
             elif msg_type == "READY":
                 client_id = fields[1]
