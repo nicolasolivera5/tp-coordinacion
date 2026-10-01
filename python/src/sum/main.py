@@ -132,7 +132,7 @@ class SumFilter:
 
             logging.info(f"Broadcasting data messages for client {client_id}")
             for final_fruit_item in client_data.values():
-                self.data_output_exchanges[self._get_agregation_key(final_fruit_item.fruit)].send(message_protocol.internal.serialize(
+                self.data_output_exchanges[self._get_agregation_key(client_id, final_fruit_item.fruit)].send(message_protocol.internal.serialize(
                     [client_id, final_fruit_item.fruit, final_fruit_item.amount]
                 ))
 
@@ -215,8 +215,9 @@ class SumFilter:
 
         ack()
 
-    def _get_agregation_key(self, fruit):
-        hex_to_int = int(hashlib.sha256(fruit.encode()).hexdigest(), 16)
+    def _get_agregation_key(self, client_id, fruit):
+        key = f"{client_id}_{fruit}"
+        hex_to_int = int(hashlib.sha256(key.encode()).hexdigest(), 16)
         return hex_to_int % AGGREGATION_AMOUNT
 
     # procesa los mensajes de datos y el eof de input_queue
