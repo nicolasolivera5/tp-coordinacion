@@ -12,19 +12,58 @@ Para resolver consultas de múltiples clientes de forma concurrente sin que sus 
 ---
 
 ## 2. Coordinación entre Réplicas de `Sum`
-En la etapa de `Sum` todas las instancias compiten como consumidores de la misma cola compartida de entrada (`input_queue`). Lo que genera dos problemas:
-1. **Notificación de fin de datos única**: Los mensajes de datos de un cliente se reparten entre las distintas réplicas de `Sum`, pero el mensaje de `EOF` es tomado por solo una de ellas desde la cola `input_queue`.
-2. **Condiciones de carrera y desincronización**: Las réplicas que no recibieron el `EOF` directamente deben enterarse de la finalización del cliente para vaciar sus acumuladores, pero sin adelantarse a los mensajes de datos que aún tienen en proceso.
+En la etapa de `Sum`, todas las réplicas compiten como consumidores concurrentes sobre la misma cola compartida de entrada (`input_queue`). Esta arquitectura genera dos desafíos fundamentales:
+1. **Notificación de fin de datos única**: Los mensajes de datos de un cliente se distribuyen entre las distintas réplicas de `Sum`, pero el mensaje de `EOF` es tomado por solo una de ellas desde la cola `input_queue`.
+2. **Condiciones de carrera y desincronización**: Las réplicas que no recibieron el `EOF` directamente deben enterarse de la finalización del cliente para vaciar sus acumuladores hacia `Aggregation`, pero sin emitir sus resultados antes de que se hayan terminado de procesar los mensajes de datos que aún se encuentran en tránsito o en buffers locales.
 
-### 2.1 Mecanismo de Coordinación Implementado:
-- **Exchange de Control (`SUM_CONTROL_EXCHANGE`)**: Se configuró un exchange de tipo topic al que cada instancia de `Sum` se suscribe con una cola exclusiva en un hilo consumidor dedicado.
-- **Broadcast de EOF**: La réplica de `Sum` que consume el `EOF` original desde `input_queue` procesa sus frutas acumuladas, emite sus totales y su `EOF` hacia `Aggregation`, y luego publica una notificación en `SUM_CONTROL_EXCHANGE`.
-- **Recepción Sincronizada en Réplicas**: Las demás réplicas reciben la notificación en su hilo de control y proceden a emitir sus acumulados y su respectivo `EOF` hacia `Aggregation`.
-- **Procesamiento doble**: Para evitar procesamientos dobles (en particular si una réplica recibe su propio mensaje de broadcast), cada réplica registra los clientes finalizados en un conjunto (`processed_eof_clients`) y descarta notificaciones repetidas.
+---
 
-### 2.2 Resolución de Condiciones de Carrera:
-- **Prefetch Unitario (`prefetch_count=1`)**: Por defecto, RabbitMQ entrega mensajes en ráfagas al buffer TCP del cliente. Sin límite de prefetch, un `Sum` podía tener datos en su memoria local aún no procesados cuando le llegaba el aviso de control, provocando pérdidas de datos. Con `basic_qos(prefetch_count=1)`, RabbitMQ entrega estrictamente un mensaje a la vez por consumidor, garantizando que no existan mensajes ocultos en buffers locales.
-- **Exclusión Mutua (`threading.RLock`)**: Se sincronizó el procesamiento del mensaje en el hilo principal (`_process_data_messsage`) con el callback del hilo de control (`_process_control_message`). Si un `Sum` se encuentra computando una fruta cuando llega el aviso de control, el hilo de control espera a que finalice la suma antes de vaciar el acumulador y emitir el `EOF`.
+### 2.1 Evolución de las Soluciones Analizadas
+
+Durante el diseño e iteración del sistema se evaluaron distintas alternativas para resolver la coordinación entre las réplicas de `Sum`:
+
+#### Versión 1: Broadcast simple con `RLock` y `prefetch_count=1`
+- **Idea**: La réplica que extraía el `EOF` de `input_queue` emitía un broadcast por un topic exchange (`SUM_CONTROL_EXCHANGE`) a las demás réplicas. El acceso a las estructuras en memoria se protegía con un `threading.RLock()`.
+- **Falencia identicada**: Aunque `prefetch_count=1` asegura que un consumidor no acumule más de un mensaje sin confirmar en su buffer local de RabbitMQ, la entrega de mensajes a través del broker hacia múltiples consumidores corre sobre conexiones TCP independientes. RabbitMQ no espera el ACK de un consumidor antes de despachar el siguiente mensaje a otro consumidor libre. Por ende, un mensaje de datos podía estar viajando por TCP hacia `Sum_1` mientras el broker ya le entregaba el `EOF` a `Sum_2`. Si `Sum_2` emitía el broadcast de inmediato, el aviso de fin podía ganarle al dato en vuelo de `Sum_1`, provocando que este vaciara sus resultados omitiendo dicho registro.
+
+#### Versión 2: Token circulante por la misma cola (`input_queue`)
+- **Idea**: En lugar de utilizar un exchange de control separado, el nodo que recibía el `EOF` reinyectaba un token con un contador decremental en la propia `input_queue`. Como los datos y el token viajaban por la misma cola FIFO, se garantizaba formalmente que el token siempre llegaba detrás de los datos.
+- **Descarte**: Aunque formalmente correcto, este esquema presentaba serios problemas de escalabilidad y latencia. Si un nodo que ya había procesado el token volvía a extraerlo de la cola por round-robin, debía reencolarlo repetidamente hasta que todos los demás nodos lo hubiesen consumido. Esto generaba un efecto de *busy-polling* sobre la cola compartida y una sobrecarga innecesaria sobre el broker RabbitMQ.
+
+#### Versión 3: Coordinación delegada a `Aggregation`
+- **Idea**: Eliminar la coordinación interna entre réplicas de `Sum` y delegar la detección del fin de datos en las instancias de `Aggregation`.
+- **Descarte**: `Aggregation` particiona las frutas por hash (`sha256(fruit) % AGGREGATION_AMOUNT`) y desconoce de antemano cuántos mensajes o qué frutas procesó cada réplica de `Sum`. Para que `Aggregation` pudiera detectar el fin global sin un broadcast previo de `Sum`, se requería que cada nodo de `Sum` conociera el total de mensajes de cada partición o que `Aggregation` implementara una compleja matriz de sincronización cruzada, acoplando innecesariamente responsabilidades de distintas etapas del pipeline.
+
+---
+
+### 2.2 Solución Final Implementada: Conteo Distribuido y Barrera Reactiva de 2 Fases
+
+La solución definitiva adoptada desacopla el orden temporal de las conexiones TCP y garantiza convergencia mediante la **conservación de mensajes** y un esquema de dos fases (`PREPARE` / `READY` / `COMMIT`) con enrutamiento dirigido:
+
+1. **Numeración y Total en Gateway (`MessageHandler`)**:
+   - Cada cliente mantiene un contador `msg_count` que se incrementa con cada mensaje de datos emitido.
+   - Al finalizar la ingesta, el Gateway emite el `EOF` conteniendo el identificador del cliente y el **total exacto de mensajes emitidos**: `[client_id, total_msg_count]`.
+
+2. **Coordinador Dinámico en `Sum`**:
+   - La réplica de `Sum` que extrae el `EOF` de `input_queue` asume automáticamente el rol de **Coordinador** para ese `client_id`.
+   - Inicializa una estructura de coordinación con `total_expected` y registra su propio conteo de mensajes procesados localmente.
+   - Si su conteo local ya iguala el total esperado (por ejemplo, si todas las frutas fueron procesadas por esta réplica o si `SUM_AMOUNT == 1`), emite directamente el `COMMIT`. De lo contrario, emite un mensaje broadcast `["PREPARE", client_id, ID]` a través de `SUM_CONTROL_EXCHANGE`.
+
+3. **Enrutamiento Dirigido de `READY` mediante Routing Keys (`READY_{coordinator_id}`)**:
+   - Cada réplica se suscribe a su cola de control privada con dos routing keys:
+     - `SUM_CONTROL_EXCHANGE`: canal broadcast donde recibe `PREPARE` y `COMMIT`.
+     - `f"READY_{ID}"`: canal unicast privado donde solo este nodo recibe respuestas `READY` cuando actúa como coordinador.
+   - Las réplicas participantes, al recibir `PREPARE`, registran quién es el coordinador (`coordinators[client_id] = coordinator_id`) y le responden su conteo actual mediante `["READY", client_id, ID, count]`, enviándolo **exclusivamente a la routing key `f"READY_{coordinator_id}"`**. De esta forma, las respuestas no saturan a las demás réplicas.
+
+4. **Manejo Reactivo de Mensajes Rezagados**:
+   - Si una réplica de `Sum` recibe un mensaje de datos en `_process_data` después de haber enviado su `READY` inicial (un dato rezagado que estaba en tránsito), incrementa su contador local y, al verificar que `client_id in self.coordinators`, **envía automáticamente un nuevo `READY` actualizado** al coordinador con el conteo incrementado.
+   - Gracias a esto, no se requieren temporizadores (*timers*), esperas activas (*busy loops*) ni sondeos periódicos. El sistema es puramente guiado por eventos.
+
+5. **Corte y Emisión de `COMMIT`**:
+   - El coordinador acumula en memoria los conteos reportados por cada nodo: `counts[sender_id] = count`.
+   - Apenas la suma de conteos de todos los nodos alcanza el total esperado ($\sum \text{counts} = \text{total\_expected}$), se tiene la certeza matemática de que **todos los mensajes de datos del cliente fueron consumidos en el clúster**.
+   - El coordinador emite el broadcast de `["COMMIT", client_id]` a través de `SUM_CONTROL_EXCHANGE` y vacía sus propios acumuladores (`_process_eof`).
+   - Al recibir el `COMMIT`, cada réplica participante vacía sus datos acumulados hacia `Aggregation` y envía su respectivo `EOF`, completando la barrera sin pérdidas ni carreras.
 
 ---
 
@@ -53,9 +92,12 @@ La etapa de `Join` unifica los resultados parciales calculados por las réplicas
   - **Distribución de Cómputo (`Aggregation`)**: El particionamiento por hash asegura que el espacio de claves (frutas) se reparta equitativamente entre los nodos de agregación, evitando cuellos de botella de memoria y optimizando los ordenamientos locales.
   - **Filtrado Temprano y Carga Constante en `Join`**: Cada réplica de `Aggregation` filtra y envía como máximo `TOP_SIZE` elementos. Por lo tanto, el volumen de datos que procesa `Join` por cliente está acotado superiormente por `AGGREGATION_AMOUNT * TOP_SIZE`, desacoplando completamente el costo de la etapa final del volumen total de registros de entrada.
 - **Sobrecarga de Control y Mensajes de Coordinación**:
-  - La coordinación entre réplicas de `Sum` utiliza un exchange topic dedicado con $O(S)$ mensajes por cliente (donde $S$ es `SUM_AMOUNT`).
+  - La coordinación entre réplicas de `Sum` (mediante el esquema `PREPARE` $\to$ `READY` $\to$ `COMMIT`) requiere únicamente $O(S)$ mensajes de control por cliente:
+    - $1$ broadcast de `PREPARE`.
+    - $(S - 1)$ respuestas dirigidas de `READY` enviadas únicamente al coordinador.
+    - $1$ broadcast de `COMMIT` (más eventualmente algún `READY` adicional si hubo datos rezagados en vuelo).
   - El traspaso hacia `Aggregation` requiere $S \times A$ mensajes de `EOF` por cliente ($A$ = `AGGREGATION_AMOUNT`), y la entrega a `Join` requiere $A$ mensajes.
-  - Esta sobrecarga de control depende exclusivamente de la cantidad de réplicas configuradas y es completamente independiente del volumen de datos del dataset ($N$), logrando una alta eficiencia a medida que el volumen de datos crece.
+  - Esta sobrecarga de control depende exclusivamente de la cantidad de réplicas configuradas ($S$ y $A$) y es completamente independiente del volumen de datos del dataset ($N$), logrando una alta eficiencia a medida que el volumen de datos crece.
 
 ---
 

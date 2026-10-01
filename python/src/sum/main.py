@@ -29,13 +29,32 @@ class SumFilter:
             self.data_output_exchanges.append(data_output_exchange)
         self.amount_by_fruit_and_client = {}
         self.processed_eof_clients = set()
+        self.msg_count_by_client = {}
+        self.coordinators = {}
+
+        # estado del nodo cuando actúa como coordinador de un client_id:
+        # {client_id: {"total_expected": N, "counts": {sum_id: count}}}
+        self.active_coordinations = {}
+
         self.lock = threading.RLock()
 
-        self.control_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
+        # canales de envio de control
+        self.broadcast_sender = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
         )
+        # emisores punto a punto para enviar READY al coordinador específico
+        self.ready_senders = {}
+        for i in range(SUM_AMOUNT):
+            self.ready_senders[i] = middleware.MessageMiddlewareExchangeRabbitMQ(
+                MOM_HOST, SUM_CONTROL_EXCHANGE, [f"READY_{i}"]
+            )
+
+        # consumidor de control (hilo secundario)
+        # escucha el exchange de control con dos routing keys:
+        # SUM_CONTROL_EXCHANGE: mensajes broadcast (PREPARE, COMMIT) para todos los Sum.
+        # READY_{ID}: mensajes dirigidos exclusivamente a este nodo cuando es coordinador.
         self.control_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE, f"READY_{ID}"]
         )
 
         threading.Thread(
@@ -78,9 +97,14 @@ class SumFilter:
         except Exception:
             pass
         try:
-            self.control_exchange.close()
+            self.broadcast_sender.close()
         except Exception:
             pass
+        for sender in self.ready_senders.values():
+            try:
+                sender.close()
+            except Exception:
+                pass
         for exchange in self.data_output_exchanges:
             try:
                 exchange.close()
@@ -88,12 +112,24 @@ class SumFilter:
                 pass
 
     def _process_data(self, client_id, fruit, amount):
-        logging.info(f"Process data")
-        with self.lock:
-            self.amount_by_fruit_and_client.setdefault(client_id, {})
-            self.amount_by_fruit_and_client[client_id][fruit] = self.amount_by_fruit_and_client[client_id].get(
-                fruit, fruit_item.FruitItem(fruit, 0)
-            ) + fruit_item.FruitItem(fruit, int(amount))
+        logging.info(f"Process data for client {client_id}")
+        if client_id in self.processed_eof_clients:
+            return
+        self.amount_by_fruit_and_client.setdefault(client_id, {})
+        self.amount_by_fruit_and_client[client_id][fruit] = self.amount_by_fruit_and_client[client_id].get(
+            fruit, fruit_item.FruitItem(fruit, 0)
+        ) + fruit_item.FruitItem(fruit, int(amount))
+        self.msg_count_by_client[client_id] = self.msg_count_by_client.get(client_id, 0) + 1
+
+        # Si ya habíamos recibido un PREPARE para este cliente, este dato llegó rezagado.
+        # Reenviamos el nuevo conteo directamente al coordinador para actualizar la suma.
+        if client_id in self.coordinators:
+            coordinator_id = self.coordinators[client_id]
+            count = self.msg_count_by_client[client_id]
+            if coordinator_id in self.ready_senders:
+                self.ready_senders[coordinator_id].send(
+                    message_protocol.internal.serialize(["READY", client_id, ID, count])
+                )
 
     def _process_eof(self, client_id):
         with self.lock:
@@ -101,36 +137,107 @@ class SumFilter:
                 return
             self.processed_eof_clients.add(client_id)
             client_data = self.amount_by_fruit_and_client.pop(client_id, {})
+            self.msg_count_by_client.pop(client_id, None)
+            self.coordinators.pop(client_id, None)
+            self.active_coordinations.pop(client_id, None)
 
-        logging.info(f"Broadcasting data messages for client {client_id}")
-        for final_fruit_item in client_data.values():
-            self.data_output_exchanges[self._get_agregation_key(final_fruit_item.fruit)].send(message_protocol.internal.serialize(
-                [client_id, final_fruit_item.fruit, final_fruit_item.amount]
-            ))
+            logging.info(f"Broadcasting data messages for client {client_id}")
+            for final_fruit_item in client_data.values():
+                self.data_output_exchanges[self._get_agregation_key(final_fruit_item.fruit)].send(message_protocol.internal.serialize(
+                    [client_id, final_fruit_item.fruit, final_fruit_item.amount]
+                ))
 
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([client_id]))
+            logging.info(f"Broadcasting EOF message for client {client_id}")
+            for data_output_exchange in self.data_output_exchanges:
+                data_output_exchange.send(message_protocol.internal.serialize([client_id]))
 
+    # invocado por el nodo que extrae el EOF original de input_queue (asume rol coordinador)
+    def _start_coordination(self, client_id, total_expected):
+        if client_id in self.processed_eof_clients:
+            return
+        my_count = self.msg_count_by_client.get(client_id, 0)
+        self.active_coordinations[client_id] = {
+            "total_expected": total_expected,
+            "counts": {ID: my_count}
+        }
+        # si justo recibio todos los mensajes el envia el commit
+        if my_count >= total_expected:
+            self._commit_coordination(client_id)
+        else:
+            # envia un mensaje a todas las replicas de sum para pedirles su conteo
+            self.broadcast_sender.send(
+                message_protocol.internal.serialize(["PREPARE", client_id, ID])
+            )
+
+    # envia el mensaje commit a todas las replicas de sum y procesa el eof local
+    def _commit_coordination(self, client_id):
+        self.active_coordinations.pop(client_id, None)
+        commit_msg = message_protocol.internal.serialize(["COMMIT", client_id])
+        self.broadcast_sender.send(commit_msg)
+        self._process_eof(client_id)
+
+    # procesa los mensajes de control
     def _process_control_message(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        client_id = fields[0]
         with self.lock:
-            self._process_eof(client_id)
+            fields = message_protocol.internal.deserialize(message)
+            msg_type = fields[0]
+
+            if msg_type == "PREPARE":
+                client_id = fields[1]
+                coordinator_id = fields[2]
+
+                # si ya procese el eof o soy el coordinador ignoro el mensaje
+                if client_id in self.processed_eof_clients or coordinator_id == ID:
+                    ack()
+                    return
+
+                # guardo al coordinador para reenviar updates si llegan mensajes rezagados
+                self.coordinators[client_id] = coordinator_id
+                count = self.msg_count_by_client.get(client_id, 0)
+
+                # respondo READY con el conteo unicamente al coordinador
+                if coordinator_id in self.ready_senders:
+                    self.ready_senders[coordinator_id].send(
+                        message_protocol.internal.serialize(["READY", client_id, ID, count])
+                    )
+
+            elif msg_type == "READY":
+                client_id = fields[1]
+                sender_id = fields[2]
+                count = fields[3]
+
+                if client_id in self.processed_eof_clients:
+                    ack()
+                    return
+
+                if client_id in self.active_coordinations:
+                    coordination = self.active_coordinations[client_id]
+                    coordination["counts"][sender_id] = count
+                    total_received = sum(coordination["counts"].values())
+
+                    # si la suma de todos los conteos alcanza el total esperado
+                    if total_received >= coordination["total_expected"]:
+                        self._commit_coordination(client_id)
+
+            elif msg_type == "COMMIT":
+                client_id = fields[1]
+                self.coordinators.pop(client_id, None)
+                self._process_eof(client_id)
+
         ack()
 
     def _get_agregation_key(self, fruit):
         hex_to_int = int(hashlib.sha256(fruit.encode()).hexdigest(), 16)
         return hex_to_int % AGGREGATION_AMOUNT
 
+    # procesa los mensajes de datos y el eof de input_queue
     def _process_data_messsage(self, message, ack, nack):
         with self.lock:
             fields = message_protocol.internal.deserialize(message)
             if len(fields) == 3:
                 self._process_data(*fields)
             else:
-                self._process_eof(fields[0])
-                self.control_exchange.send(message_protocol.internal.serialize([fields[0]])) ## le paso a los otros sum que el cliente termino
+                self._start_coordination(fields[0], fields[1])
         ack()
 
     def start(self):
