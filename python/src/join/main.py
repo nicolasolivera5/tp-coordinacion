@@ -57,16 +57,21 @@ class JoinFilter:
         self.final_top(client_id, fruit_top_parcial)
         self.eof_client_count[client_id] = self.eof_client_count.get(client_id, 0) + 1
         if self.eof_client_count[client_id] == AGGREGATION_AMOUNT:
-            self.output_queue.send(message_protocol.internal.serialize([client_id, self.fruit_top_by_client[client_id][:TOP_SIZE]]))
+            final_top = [(item.fruit, item.amount) for item in self.fruit_top_by_client.pop(client_id, [])]
+            self.eof_client_count.pop(client_id, None)
+            self.output_queue.send(message_protocol.internal.serialize([client_id, final_top]))
         ack()
 
     def final_top(self, client_id, fruit_top_parcial):
         if client_id not in self.fruit_top_by_client:
             self.fruit_top_by_client[client_id] = []
             
-        self.fruit_top_by_client[client_id].extend(fruit_top_parcial)
-        self.fruit_top_by_client[client_id].sort(key=lambda item: item[1], reverse=True)
-        self.fruit_top_by_client[client_id] = self.fruit_top_by_client[client_id]
+        fruit_items = [fruit_item.FruitItem(fruit, amount) for fruit, amount in fruit_top_parcial]
+        self.fruit_top_by_client[client_id].extend(fruit_items)
+        fruit_top_list = sorted(self.fruit_top_by_client[client_id])
+        fruit_chunk = list(fruit_top_list[-TOP_SIZE:])
+        fruit_chunk.reverse()
+        self.fruit_top_by_client[client_id] = fruit_chunk
 
     def start(self):
         try:

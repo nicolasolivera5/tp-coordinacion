@@ -54,7 +54,9 @@ class AggregationFilter:
         logging.info("Processing data message")
         self.amount_by_fruit_and_client.setdefault(client_id, {})
         self.amount_by_fruit_and_client[client_id][fruit] = (
-            self.amount_by_fruit_and_client[client_id].get(fruit, 0) + int(amount)
+            self.amount_by_fruit_and_client[client_id].get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
         )
 
     def _process_eof(self, client_id):
@@ -64,8 +66,9 @@ class AggregationFilter:
         if self.eof_client_count[client_id] < SUM_AMOUNT:
             return
         
+        self.eof_client_count.pop(client_id, None)
         client_fruits = self.amount_by_fruit_and_client.pop(client_id, {})
-        fruit_items = [fruit_item.FruitItem(fruit, amount) for fruit, amount in client_fruits.items()]
+        fruit_items = list(client_fruits.values())
         fruit_top_list = sorted(fruit_items)
         fruit_chunk = list(fruit_top_list[-TOP_SIZE:])
         fruit_chunk.reverse()
