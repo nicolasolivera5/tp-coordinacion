@@ -88,7 +88,7 @@ class SumFilter:
 
     def close(self):
         if hasattr(self, "control_thread") and self.control_thread.is_alive():
-            self.control_thread.join(timeout=2)
+            self.control_thread.join()
         try:
             self.input_queue.close()
         except Exception as e:
