@@ -16,6 +16,10 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+CONTROL_PREPARE = "PREPARE"
+CONTROL_READY = "READY"
+CONTROL_COMMIT = "COMMIT"
+
 class SumFilter:
     def __init__(self):
         self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
@@ -44,7 +48,7 @@ class SumFilter:
 
         # consumidor de control
         self.control_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
-            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE, f"READY_{ID}"]
+            MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE, f"{CONTROL_READY}_{ID}"]
         )
 
         self.control_thread = threading.Thread(
@@ -114,8 +118,8 @@ class SumFilter:
             coordinator_id = self.coordinators[client_id]
             count = self.msg_count_by_client[client_id]
             self.control_exchange.send_to(
-                message_protocol.internal.serialize(["READY", client_id, ID, count]),
-                f"READY_{coordinator_id}"
+                message_protocol.internal.serialize([CONTROL_READY, client_id, ID, count]),
+                f"{CONTROL_READY}_{coordinator_id}"
             )
 
     def _process_eof(self, client_id):
@@ -153,13 +157,13 @@ class SumFilter:
         else:
             # envia un mensaje a todas las replicas de sum para pedirles su conteo
             self.control_exchange.send(
-                message_protocol.internal.serialize(["PREPARE", client_id, ID])
+                message_protocol.internal.serialize([CONTROL_PREPARE, client_id, ID])
             )
 
     # envia el mensaje commit a todas las replicas de sum y procesa el eof local
     def _commit_coordination(self, client_id):
         self.active_coordinations.pop(client_id, None)
-        commit_msg = message_protocol.internal.serialize(["COMMIT", client_id])
+        commit_msg = message_protocol.internal.serialize([CONTROL_COMMIT, client_id])
         self.control_exchange.send(commit_msg)
         self._process_eof(client_id)
 
@@ -169,7 +173,7 @@ class SumFilter:
             fields = message_protocol.internal.deserialize(message)
             msg_type = fields[0]
 
-            if msg_type == "PREPARE":
+            if msg_type == CONTROL_PREPARE:
                 client_id = fields[1]
                 coordinator_id = fields[2]
 
@@ -184,11 +188,11 @@ class SumFilter:
 
                 # respondo READY con el conteo unicamente al coordinador
                 self.control_exchange.send_to(
-                    message_protocol.internal.serialize(["READY", client_id, ID, count]),
-                    f"READY_{coordinator_id}"
+                    message_protocol.internal.serialize([CONTROL_READY, client_id, ID, count]),
+                    f"{CONTROL_READY}_{coordinator_id}"
                 )
 
-            elif msg_type == "READY":
+            elif msg_type == CONTROL_READY:
                 client_id = fields[1]
                 sender_id = fields[2]
                 count = fields[3]
@@ -206,7 +210,7 @@ class SumFilter:
                     if total_received >= coordination["total_expected"]:
                         self._commit_coordination(client_id)
 
-            elif msg_type == "COMMIT":
+            elif msg_type == CONTROL_COMMIT:
                 client_id = fields[1]
                 self.coordinators.pop(client_id, None)
                 self._process_eof(client_id)
