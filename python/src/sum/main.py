@@ -33,7 +33,6 @@ class SumFilter:
         self.coordinators = {}
 
         # estado del nodo cuando actúa como coordinador de un client_id:
-        # {client_id: {"total_expected": N, "counts": {sum_id: count}}}
         self.active_coordinations = {}
 
         self.lock = threading.RLock()
@@ -43,18 +42,16 @@ class SumFilter:
             MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE]
         )
 
-        # consumidor de control (hilo secundario)
-        # escucha el exchange de control con dos routing keys:
-        # SUM_CONTROL_EXCHANGE: mensajes broadcast (PREPARE, COMMIT) para todos los Sum.
-        # READY_{ID}: mensajes dirigidos exclusivamente a este nodo cuando es coordinador.
+        # consumidor de control
         self.control_consumer = middleware.MessageMiddlewareExchangeRabbitMQ(
             MOM_HOST, SUM_CONTROL_EXCHANGE, [SUM_CONTROL_EXCHANGE, f"READY_{ID}"]
         )
 
-        threading.Thread(
+        self.control_thread = threading.Thread(
             target=self._start_control_consumer,
             daemon=True,
-        ).start()
+        )
+        self.control_thread.start()
 
         self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
 
@@ -64,8 +61,8 @@ class SumFilter:
         finally:
             try:
                 self.control_consumer.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"Error closing control consumer: {e}")
 
     def handle_sigterm(self, signum, frame):
         logging.info("Received SIGTERM signal")
@@ -76,29 +73,31 @@ class SumFilter:
     def stop(self):
         try:
             self.input_queue.stop_consuming()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error stopping input queue consuming: {e}")
         try:
             self.control_consumer.connection.add_callback_threadsafe(
                 self.control_consumer.stop_consuming
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error requesting control consumer to stop: {e}")
 
     def close(self):
+        if hasattr(self, "control_thread") and self.control_thread.is_alive():
+            self.control_thread.join(timeout=2)
         try:
             self.input_queue.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing input queue: {e}")
         try:
             self.control_exchange.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing control exchange: {e}")
         for exchange in self.data_output_exchanges:
             try:
                 exchange.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"Error closing data output exchange: {e}")
 
     def _process_data(self, client_id, fruit, amount):
         logging.info(f"Process data for client {client_id}")
@@ -110,8 +109,7 @@ class SumFilter:
         ) + fruit_item.FruitItem(fruit, int(amount))
         self.msg_count_by_client[client_id] = self.msg_count_by_client.get(client_id, 0) + 1
 
-        # Si ya habíamos recibido un PREPARE para este cliente, este dato llegó rezagado.
-        # Reenviamos el nuevo conteo directamente al coordinador para actualizar la suma.
+        # si ya habíamos recibido un PREPARE para este cliente, este dato llego rezagado y actualizamos al coordinador
         if client_id in self.coordinators:
             coordinator_id = self.coordinators[client_id]
             count = self.msg_count_by_client[client_id]
@@ -221,7 +219,7 @@ class SumFilter:
         return hex_to_int % AGGREGATION_AMOUNT
 
     # procesa los mensajes de datos y el eof de input_queue
-    def _process_data_messsage(self, message, ack, nack):
+    def _process_data_message(self, message, ack, nack):
         with self.lock:
             fields = message_protocol.internal.deserialize(message)
             if len(fields) == 3:
@@ -232,7 +230,7 @@ class SumFilter:
 
     def start(self):
         try:
-            self.input_queue.start_consuming(self._process_data_messsage)
+            self.input_queue.start_consuming(self._process_data_message)
         finally:
             self.close()
 
@@ -242,7 +240,10 @@ def main():
     try:
         sum_filter.start()
     except SystemExit:
-        pass
+        logging.info("Process terminated cleanly")
+    except Exception as e:
+        logging.error(f"Unexpected error in sum filter: {e}")
+        return 1
     return 0
 
 

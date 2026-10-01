@@ -37,18 +37,18 @@ class JoinFilter:
     def stop(self):
         try:
             self.input_queue.stop_consuming()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error stopping input queue consuming: {e}")
 
     def close(self):
         try:
             self.input_queue.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing input queue: {e}")
         try:
             self.output_queue.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing output queue: {e}")
 
     def process_messsage(self, message, ack, nack):
         logging.info("Received top")
@@ -81,8 +81,10 @@ def main():
     try:
         join_filter.start()
     except SystemExit:
-        pass
-
+        logging.info("Process terminated cleanly")
+    except Exception as e:
+        logging.error(f"Unexpected error in join filter: {e}")
+        return 1
     return 0
 
 

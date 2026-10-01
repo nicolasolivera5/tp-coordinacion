@@ -1,6 +1,5 @@
 import os
 import logging
-import bisect
 import signal
 import sys
 
@@ -25,7 +24,7 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top_for_client = {}
+        self.amount_by_fruit_and_client = {}
         self.eof_client_count = {}
         self._prev_sigterm_handler = signal.signal(signal.SIGTERM, self.handle_sigterm)
 
@@ -38,31 +37,25 @@ class AggregationFilter:
     def stop(self):
         try:
             self.input_exchange.stop_consuming()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error stopping input exchange consuming: {e}")
 
     def close(self):
         try:
             self.input_exchange.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing input exchange: {e}")
         try:
             self.output_queue.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"Error closing output queue: {e}")
 
     def _process_data(self, client_id, fruit, amount):
         logging.info("Processing data message")
-        self.fruit_top_for_client.setdefault(client_id, [])
-        fruit_top = self.fruit_top_for_client[client_id]
-        for i in range(len(fruit_top)):
-            if fruit_top[i].fruit == fruit:
-                updated_item = fruit_top.pop(i) + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                bisect.insort(self.fruit_top_for_client[client_id], updated_item)
-                return
-        bisect.insort(self.fruit_top_for_client[client_id], fruit_item.FruitItem(fruit, amount))
+        self.amount_by_fruit_and_client.setdefault(client_id, {})
+        self.amount_by_fruit_and_client[client_id][fruit] = (
+            self.amount_by_fruit_and_client[client_id].get(fruit, 0) + int(amount)
+        )
 
     def _process_eof(self, client_id):
         logging.info("Received EOF")
@@ -71,15 +64,12 @@ class AggregationFilter:
         if self.eof_client_count[client_id] < SUM_AMOUNT:
             return
         
-        fruit_top_list = sorted(self.fruit_top_for_client.pop(client_id, []))
+        client_fruits = self.amount_by_fruit_and_client.pop(client_id, {})
+        fruit_items = [fruit_item.FruitItem(fruit, amount) for fruit, amount in client_fruits.items()]
+        fruit_top_list = sorted(fruit_items)
         fruit_chunk = list(fruit_top_list[-TOP_SIZE:])
         fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
-        )
+        fruit_top = [(item.fruit, item.amount) for item in fruit_chunk]
         self.output_queue.send(message_protocol.internal.serialize([client_id, fruit_top]))
 
 
@@ -105,7 +95,10 @@ def main():
     try:
         aggregation_filter.start()
     except SystemExit:
-        pass
+        logging.info("Process terminated cleanly")
+    except Exception as e:
+        logging.error(f"Unexpected error in aggregation filter: {e}")
+        return 1
     return 0
 
 
